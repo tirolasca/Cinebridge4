@@ -1,0 +1,191 @@
+# Cinebridge - ATVIV: arquitetura containerizada
+# Uso: docker compose up --build -d
+# Variáveis podem ser sobrescritas por um arquivo .env na raiz (ver valores padrão abaixo).
+
+x-postgres: &postgres
+  image: postgres:18-alpine
+  restart: unless-stopped
+  networks: [cinebridge-net]
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+    start_period: 10s
+
+x-servico: &servico
+  restart: unless-stopped
+  networks: [cinebridge-net]
+  environment: &servico-env
+    NODE_ENV: ${NODE_ENV:-production}
+    RABBITMQ_URL: amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@cinebridge-mq:5672
+
+services:
+  # ---------- Mensageria ----------
+  cinebridge-mq:
+    image: rabbitmq:4-management-alpine
+    container_name: cinebridge-mq
+    restart: unless-stopped
+    networks: [cinebridge-net]
+    ports:
+      - "5672:5672"     # AMQP
+      - "15672:15672"   # Interface de gerenciamento
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+    volumes:
+      - mq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ---------- Bancos de dados (um por serviço) ----------
+  profissionais-db:
+    <<: *postgres
+    container_name: profissionais-db
+    ports: ["5432:5432"]
+    environment:
+      POSTGRES_USER: ${PROFISSIONAIS_DB_USER:-cinebridge}
+      POSTGRES_PASSWORD: ${PROFISSIONAIS_DB_PASSWORD:-cinebridge}
+      POSTGRES_DB: profissionais
+    volumes: [profissionais-db-data:/var/lib/postgresql]
+
+  projetos-db:
+    <<: *postgres
+    container_name: projetos-db
+    ports: ["5433:5432"]
+    environment:
+      POSTGRES_USER: ${PROJETOS_DB_USER:-cinebridge}
+      POSTGRES_PASSWORD: ${PROJETOS_DB_PASSWORD:-cinebridge}
+      POSTGRES_DB: projetos
+    volumes: [projetos-db-data:/var/lib/postgresql]
+
+  recomendacoes-db:
+    <<: *postgres
+    container_name: recomendacoes-db
+    ports: ["5434:5432"]
+    environment:
+      POSTGRES_USER: ${RECOMENDACOES_DB_USER:-cinebridge}
+      POSTGRES_PASSWORD: ${RECOMENDACOES_DB_PASSWORD:-cinebridge}
+      POSTGRES_DB: recomendacoes
+    volumes: [recomendacoes-db-data:/var/lib/postgresql]
+
+  notificacoes-db:
+    <<: *postgres
+    container_name: notificacoes-db
+    ports: ["5435:5432"]
+    environment:
+      POSTGRES_USER: ${NOTIFICACOES_DB_USER:-cinebridge}
+      POSTGRES_PASSWORD: ${NOTIFICACOES_DB_PASSWORD:-cinebridge}
+      POSTGRES_DB: notificacoes
+    volumes: [notificacoes-db-data:/var/lib/postgresql]
+
+  # ---------- Microsserviços ----------
+  cinebridge-profissionais:
+    <<: *servico
+    container_name: cinebridge-profissionais
+    build: ./services/profissionais
+    ports: ["3001:3001"]
+    environment:
+      <<: *servico-env
+      PORT: 3001
+      DB_HOST: profissionais-db
+      DB_PORT: 5432
+      DB_USER: ${PROFISSIONAIS_DB_USER:-cinebridge}
+      DB_PASSWORD: ${PROFISSIONAIS_DB_PASSWORD:-cinebridge}
+      DB_NAME: profissionais
+    depends_on:
+      profissionais-db: { condition: service_healthy }
+      cinebridge-mq: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3001/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  cinebridge-projetos:
+    <<: *servico
+    container_name: cinebridge-projetos
+    build: ./services/projetos
+    ports: ["3002:3002"]
+    environment:
+      <<: *servico-env
+      PORT: 3002
+      DB_HOST: projetos-db
+      DB_PORT: 5432
+      DB_USER: ${PROJETOS_DB_USER:-cinebridge}
+      DB_PASSWORD: ${PROJETOS_DB_PASSWORD:-cinebridge}
+      DB_NAME: projetos
+    depends_on:
+      projetos-db: { condition: service_healthy }
+      cinebridge-mq: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3002/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  cinebridge-notificacoes:
+    <<: *servico
+    container_name: cinebridge-notificacoes
+    build: ./services/notificacoes
+    ports: ["3003:3003"]
+    environment:
+      <<: *servico-env
+      PORT: 3003
+      DB_HOST: notificacoes-db
+      DB_PORT: 5432
+      DB_USER: ${NOTIFICACOES_DB_USER:-cinebridge}
+      DB_PASSWORD: ${NOTIFICACOES_DB_PASSWORD:-cinebridge}
+      DB_NAME: notificacoes
+    depends_on:
+      notificacoes-db: { condition: service_healthy }
+      cinebridge-mq: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3003/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  cinebridge-api:
+    <<: *servico
+    container_name: cinebridge-api
+    build: ./services/api
+    ports: ["3000:3000"]
+    environment:
+      <<: *servico-env
+      PORT: 3000
+      DB_HOST: recomendacoes-db
+      DB_PORT: 5432
+      DB_USER: ${RECOMENDACOES_DB_USER:-cinebridge}
+      DB_PASSWORD: ${RECOMENDACOES_DB_PASSWORD:-cinebridge}
+      DB_NAME: recomendacoes
+    depends_on:
+      recomendacoes-db: { condition: service_healthy }
+      cinebridge-mq: { condition: service_healthy }
+      cinebridge-profissionais: { condition: service_healthy }
+      cinebridge-projetos: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+networks:
+  cinebridge-net:
+    name: cinebridge-net
+    driver: bridge
+
+volumes:
+  mq-data:
+  profissionais-db-data:
+  projetos-db-data:
+  recomendacoes-db-data:
+  notificacoes-db-data:
